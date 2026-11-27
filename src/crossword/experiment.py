@@ -76,7 +76,45 @@ def summarize(records: list[dict], model: str | None = None) -> dict:
     return out
 
 
-def tot_paper_records(prune: bool = True, rule: str = "deepest_first") -> list[dict]:
+def count_tokens_gpt4():
+    """Token counter for GPT-4 (tiktoken). Falls back to ~4 characters per token."""
+    try:
+        import tiktoken
+        enc = tiktoken.encoding_for_model("gpt-4")
+        return (lambda s: len(enc.encode(s))), "exact (tiktoken, gpt-4)"
+    except Exception:
+        return (lambda s: max(1, round(len(s) / 4))), "approx (chars/4: pip install tiktoken for exact)"
+
+
+def tot_paper_usage(count_tokens=None) -> dict[int, dict]:
+    """LLM usage of ToT's paper run (GPT-4, prune=True), per test puzzle.
+
+    data/tot_logs/tot_paper_calls.json lists every call that run needed, rebuilt from the
+    released trajectories (every call was verified to exist in ToT's released caches):
+      * propose calls: prompt text is exact; the n=8 answers were not saved, only the
+        parsed scores, so their output tokens are a LOWER BOUND (~7 tokens per answer line,
+        at least as many lines as the scores imply). Input is billed once per request.
+      * value calls: prompt and answer both exact.
+    """
+    from .tot_prompts import propose_prompt, value_prompt
+    count, _ = count_tokens or count_tokens_gpt4()
+    calls = json.loads((TOT_LOG_DIR / "tot_paper_calls.json").read_text())
+    out = {}
+    for rec in calls:
+        p_in = sum(count(propose_prompt.format(input=o)) for o in rec["propose_obs"])
+        p_out = 7 * sum(rec["propose_mentions_lb"])
+        v_in = sum(count(value_prompt.format(input=l)) for l in rec["value_lines"])
+        v_out = sum(count(r) for r in rec["value_responses"])
+        out[rec["idx"]] = {
+            "calls": len(rec["propose_obs"]) + len(rec["value_lines"]),
+            "propose_calls": len(rec["propose_obs"]), "value_calls": len(rec["value_lines"]),
+            "prompt_tokens": p_in + v_in, "completion_tokens": p_out + v_out,
+        }
+    return out
+
+
+def tot_paper_records(prune: bool = True, rule: str = "deepest_first", with_usage: bool = False,
+                      count_tokens=None) -> list[dict]:
     """ToT + GPT-4 results rebuilt from the trajectories ToT released (no API calls).
 
     The logs store each DFS state's actions, so we replay them to get the board.
@@ -103,4 +141,10 @@ def tot_paper_records(prune: bool = True, rule: str = "deepest_first") -> list[d
             "board": "".join(board_of(chosen)), "scores": score_board(board_of(chosen), p.solution),
             "oracle_scores": score_board(board_of(best), p.solution), "nodes": len(states),
         })
+    if with_usage:
+        if not prune:
+            raise ValueError("usage is only reconstructed for the prune=True run")
+        usage = tot_paper_usage(count_tokens)
+        for r in records:
+            r["usage"] = usage[r["idx"]]
     return records

@@ -139,24 +139,28 @@ class OpenAIChat(LLM):
     backend = "openai"
 
     def __init__(self, model: str, api_key: str | None = None, base_url: str | None = None,
-                 max_retries: int = 8, **kw):
+                 max_retries: int = 8, n_per_request: int = 20, request_kwargs: dict | None = None, **kw):
         super().__init__(model, **kw)
         from openai import OpenAI
         self.client = OpenAI(api_key=api_key or os.environ.get("OPENAI_API_KEY"),
                              base_url=base_url or os.environ.get("OPENAI_BASE_URL") or None)
         self.max_retries = max_retries
+        self.n_per_request = n_per_request          # 1 = one request per sample
+        self.request_kwargs = request_kwargs or {}  # extra API options, e.g. reasoning_effort
 
     def _generate(self, prompt, n, temperature, max_tokens):
         import openai
         outputs, p_tok, c_tok = [], 0, 0
         remaining = n
         while remaining > 0:
-            batch = min(remaining, 20)
+            batch = min(remaining, self.n_per_request)
             for attempt in range(self.max_retries):
                 try:
-                    res = self.client.chat.completions.create(
-                        model=self.model, messages=[{"role": "user", "content": prompt}],
-                        n=batch, temperature=temperature, max_tokens=max_tokens)
+                    kwargs = dict(model=self.model, messages=[{"role": "user", "content": prompt}],
+                                  temperature=temperature, max_tokens=max_tokens, **self.request_kwargs)
+                    if batch > 1:
+                        kwargs["n"] = batch
+                    res = self.client.chat.completions.create(**kwargs)
                     break
                 except (openai.RateLimitError, openai.APITimeoutError, openai.APIConnectionError,
                         openai.InternalServerError):
@@ -180,12 +184,22 @@ class HFChat(LLM):
         from transformers import AutoModelForCausalLM, AutoTokenizer
         self.torch = torch
         self.tok = AutoTokenizer.from_pretrained(model)
-        load_kw = {"device_map": "auto", "torch_dtype": torch.bfloat16}
+        if self.tok.pad_token_id is None:
+            self.tok.pad_token = self.tok.eos_token
+        if torch.cuda.is_available():
+            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16  # T4: fp16
+        else:
+            dtype = torch.float32
+        load_kw = {"device_map": "auto", "dtype": dtype}
         if load_in_4bit:
             from transformers import BitsAndBytesConfig
-            load_kw["quantization_config"] = BitsAndBytesConfig(
-                load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
-        self.hf_model = AutoModelForCausalLM.from_pretrained(model, **load_kw)
+            load_kw["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=dtype)
+        try:
+            self.hf_model = AutoModelForCausalLM.from_pretrained(model, **load_kw)
+        except TypeError:  # older transformers call it torch_dtype
+            load_kw["torch_dtype"] = load_kw.pop("dtype")
+            self.hf_model = AutoModelForCausalLM.from_pretrained(model, **load_kw)
+        self.hf_model.eval()
 
     def _generate(self, prompt, n, temperature, max_tokens):
         text = self.tok.apply_chat_template([{"role": "user", "content": prompt}],
@@ -218,9 +232,19 @@ class ScriptedLLM(LLM):
         return outputs, approx(prompt), sum(approx(o) for o in outputs)
 
 
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+
 def make_llm(backend: str, model: str, **kw) -> LLM:
+    """backend: 'gemini' (free tier, key from Google AI Studio in GEMINI_API_KEY),
+    'hf' (free, local GPU), or 'openai' (paid, OPENAI_API_KEY)."""
     if backend == "openai":
+        return OpenAIChat(model, **kw)
+    if backend == "gemini":
+        kw.setdefault("api_key", os.environ.get("GEMINI_API_KEY"))
+        kw.setdefault("base_url", GEMINI_BASE_URL)
+        kw.setdefault("n_per_request", 1)   # one request per sample: safest on Gemini's endpoint
         return OpenAIChat(model, **kw)
     if backend == "hf":
         return HFChat(model, **kw)
-    raise ValueError(f"unknown backend {backend!r} (use 'openai' or 'hf', or build ScriptedLLM directly)")
+    raise ValueError(f"unknown backend {backend!r} (use 'gemini', 'hf' or 'openai')")
