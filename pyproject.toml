@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xword"
+version = "0.1.0"
+description = "Mini-crossword solver: LLM candidates + A* search (CS 557 project)"
+requires-python = ">=3.10"
+dependencies = ["openai>=1.30", "python-dotenv", "pandas"]
+
+[project.optional-dependencies]
+hf = ["transformers>=4.43", "accelerate", "bitsandbytes", "torch"]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
