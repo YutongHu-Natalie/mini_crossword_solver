@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import time
 from dataclasses import dataclass, field, asdict
@@ -142,8 +143,10 @@ class OpenAIChat(LLM):
                  max_retries: int = 8, n_per_request: int = 20, request_kwargs: dict | None = None, **kw):
         super().__init__(model, **kw)
         from openai import OpenAI
+        # timeout + no hidden SDK retries: our loop below retries and says what it is waiting for
         self.client = OpenAI(api_key=api_key or os.environ.get("OPENAI_API_KEY"),
-                             base_url=base_url or os.environ.get("OPENAI_BASE_URL") or None)
+                             base_url=base_url or os.environ.get("OPENAI_BASE_URL") or None,
+                             timeout=120, max_retries=0)
         self.max_retries = max_retries
         self.n_per_request = n_per_request          # 1 = one request per sample
         self.request_kwargs = request_kwargs or {}  # extra API options, e.g. reasoning_effort
@@ -163,10 +166,18 @@ class OpenAIChat(LLM):
                     res = self.client.chat.completions.create(**kwargs)
                     break
                 except (openai.RateLimitError, openai.APITimeoutError, openai.APIConnectionError,
-                        openai.InternalServerError):
+                        openai.InternalServerError) as e:
+                    msg = str(e)
+                    if isinstance(e, openai.RateLimitError) and re.search(r"per ?day|PerDay|daily", msg, re.I):
+                        raise RuntimeError("Daily request limit reached for this model. Results so far are "
+                                           "saved; re-run tomorrow (or switch model).\n" + msg[:500]) from e
                     if attempt == self.max_retries - 1:
                         raise
-                    time.sleep(min(60, 2 ** attempt))
+                    m = re.search(r"retry in ([0-9.]+)\s*s", msg, re.I)
+                    wait = min(120, float(m.group(1)) + 1) if m else min(60, 2 ** attempt)
+                    print(f"  [{type(e).__name__}] waiting {wait:.0f}s, then retrying "
+                          f"({attempt + 1}/{self.max_retries})", flush=True)
+                    time.sleep(wait)
             outputs += [c.message.content or "" for c in res.choices]
             p_tok += res.usage.prompt_tokens
             c_tok += res.usage.completion_tokens
@@ -241,7 +252,7 @@ def make_llm(backend: str, model: str, **kw) -> LLM:
     if backend == "openai":
         return OpenAIChat(model, **kw)
     if backend == "gemini":
-        kw.setdefault("api_key", os.environ.get("GEMINI_API_KEY"))
+        kw.setdefault("api_key", os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
         kw.setdefault("base_url", GEMINI_BASE_URL)
         kw.setdefault("n_per_request", 1)   # one request per sample: safest on Gemini's endpoint
         return OpenAIChat(model, **kw)
